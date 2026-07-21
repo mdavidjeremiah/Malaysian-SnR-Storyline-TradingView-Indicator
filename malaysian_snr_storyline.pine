@@ -1,0 +1,264 @@
+// This Pine Script code is subject to the terms of the Mozilla Public License 2.0
+//@version=6
+indicator("Malaysian SnR + Storyline (A/V/Gap, Fresh Filter, Entry-SL-TP)", overlay=true, max_lines_count=500, max_labels_count=500)
+
+// ============================================================================
+// INPUTS
+// ============================================================================
+grpLevels = "SnR Levels"
+pivotLen        = input.int(3, "Pivot Lookback (left=right)", minval=1, group=grpLevels)
+maxLevels       = input.int(25, "Max levels stored per type", minval=5, group=grpLevels)
+showAlevels     = input.bool(true, "Show A-Levels (resistance)", group=grpLevels)
+showVlevels     = input.bool(true, "Show V-Levels (support)", group=grpLevels)
+showGaps        = input.bool(true, "Show Open-Close / Gap Levels", group=grpLevels)
+hideUnfresh     = input.bool(false, "Hide unfresh levels", group=grpLevels)
+
+grpFilter = "Probability Filter"
+minAtrDist      = input.float(0.5, "Min distance from price (x ATR)", minval=0.0, group=grpFilter)
+useHtf          = input.bool(true, "Require HTF confluence", group=grpFilter)
+htf             = input.timeframe("60", "Higher timeframe", group=grpFilter)
+htfTolAtr       = input.float(0.5, "HTF confluence tolerance (x ATR)", minval=0.05, group=grpFilter)
+
+grpTrade = "Entry / SL / TP"
+atrLen          = input.int(14, "ATR length", group=grpTrade)
+slBufferAtr     = input.float(0.25, "SL buffer beyond level (x ATR)", group=grpTrade)
+rr              = input.float(2.0, "Reward:Risk (used if no opposing level found)", group=grpTrade)
+showSignals     = input.bool(true, "Plot entry signals", group=grpTrade)
+
+// ============================================================================
+// UDT: a single SnR level
+// ============================================================================
+type Level
+    float price
+    int   barIndex
+    bool  isResistance   // true = A-level / bearish gap, false = V-level / bullish gap
+    bool  fresh
+    bool  broken
+    line  ln
+    label lbl
+
+var array<Level> aLevels   = array.new<Level>()   // A-levels (resistance)
+var array<Level> vLevels   = array.new<Level>()   // V-levels (support)
+var array<Level> gapLevels = array.new<Level>()   // Open-Close / Gap levels
+
+atrVal = ta.atr(atrLen)
+
+// ============================================================================
+// HELPER: draw / refresh a level's line + label
+// ============================================================================
+drawLevel(Level lv) =>
+    color col = lv.broken ? color.gray : (lv.isResistance ? color.red : color.lime)
+    int style = lv.fresh and not lv.broken ? line.style_solid : line.style_dashed
+    if not na(lv.ln)
+        line.set_xy2(lv.ln, bar_index, lv.price)
+        line.set_color(lv.ln, col)
+        line.set_style(lv.ln, style)
+    if not na(lv.lbl)
+        label.set_x(lv.lbl, bar_index)
+
+// ============================================================================
+// HELPER: create a new level object + its drawing objects
+// ============================================================================
+newLevel(float price, bool isRes, string tag) =>
+    Level lv = Level.new(price, bar_index, isRes, true, false, na, na)
+    col = isRes ? color.red : color.lime
+    lv.ln := line.new(bar_index, price, bar_index, price, color=col, style=line.style_solid, width=1)
+    lv.lbl := label.new(bar_index, price, tag, style=label.style_none,
+         textcolor=col, color=color.new(color.black,100), size=size.tiny)
+    lv
+
+// ============================================================================
+// HELPER: push into array, capping size (drop oldest broken/oldest first)
+// ============================================================================
+pushLevel(array<Level> arr, Level lv) =>
+    array.push(arr, lv)
+    if array.size(arr) > maxLevels
+        Level old = array.shift(arr)
+        line.delete(old.ln)
+        label.delete(old.lbl)
+
+// ============================================================================
+// 1. PIVOT-BASED A / V LEVELS  (line-chart style: pivots on CLOSE)
+// ============================================================================
+pivHi = ta.pivothigh(close, pivotLen, pivotLen)
+pivLo = ta.pivotlow(close, pivotLen, pivotLen)
+
+if not na(pivHi) and showAlevels
+    pushLevel(aLevels, newLevel(pivHi, true, "A"))
+
+if not na(pivLo) and showVlevels
+    pushLevel(vLevels, newLevel(pivLo, false, "V"))
+
+// ============================================================================
+// 2. OPEN-CLOSE / GAP LEVELS (two same-colour candles, gap between them)
+// ============================================================================
+bullGap = close[1] > open[1] and close > open and open > close[1]     // bullish gap up
+bearGap = close[1] < open[1] and close < open and open < close[1]     // bearish gap down
+
+if showGaps and bullGap
+    pushLevel(gapLevels, newLevel(math.avg(close[1], open), false, "Gap"))   // acts as support
+if showGaps and bearGap
+    pushLevel(gapLevels, newLevel(math.avg(close[1], open), true, "Gap"))    // acts as resistance
+
+// ============================================================================
+// 3. FRESH / UNFRESH / BROKEN TRACKING
+//    - wick touch -> unfresh
+//    - body close through -> broken (flipped)
+// ============================================================================
+updateArray(array<Level> arr) =>
+    for i = 0 to array.size(arr) - 1
+        Level lv = array.get(arr, i)
+        if not lv.broken
+            // wick touch check
+            if high >= lv.price and low <= lv.price
+                lv.fresh := false
+            // body break check
+            bool bodyBroke = lv.isResistance ? close > lv.price and open > lv.price and close[1] <= lv.price
+                                              : close < lv.price and open < lv.price and close[1] >= lv.price
+            if bodyBroke
+                lv.broken := true
+        drawLevel(lv)
+
+updateArray(aLevels)
+updateArray(vLevels)
+updateArray(gapLevels)
+
+// ============================================================================
+// 4. STORYLINE: market structure via swing highs/lows -> trend + BOS/CHoCH
+// ============================================================================
+var float lastSwingHigh = na
+var float lastSwingLow  = na
+var float prevSwingHigh = na
+var float prevSwingLow  = na
+var string trend = "range"   // "bull", "bear", "range"
+
+if not na(pivHi)
+    prevSwingHigh := lastSwingHigh
+    lastSwingHigh := pivHi
+if not na(pivLo)
+    prevSwingLow := lastSwingLow
+    lastSwingLow := pivLo
+
+if not na(lastSwingHigh) and not na(prevSwingHigh) and not na(lastSwingLow) and not na(prevSwingLow)
+    bool hh = lastSwingHigh > prevSwingHigh
+    bool hl = lastSwingLow  > prevSwingLow
+    bool lh = lastSwingHigh < prevSwingHigh
+    bool ll = lastSwingLow  < prevSwingLow
+    trend := hh and hl ? "bull" : lh and ll ? "bear" : trend   // keep prior trend on mixed structure
+
+// BOS: close breaks beyond last swing in the trend direction
+bosUp   = trend == "bull" and not na(lastSwingHigh) and close > lastSwingHigh
+bosDown = trend == "bear" and not na(lastSwingLow)  and close < lastSwingLow
+// CHoCH: close breaks against the current trend
+chochDown = trend == "bull" and not na(lastSwingLow)  and close < lastSwingLow
+chochUp   = trend == "bear" and not na(lastSwingHigh) and close > lastSwingHigh
+
+if chochDown
+    trend := "bear"
+if chochUp
+    trend := "bull"
+
+if bosUp or bosDown
+    label.new(bar_index, bosUp ? low : high, "BOS", style=bosUp ? label.style_label_up : label.style_label_down,
+         color=color.new(color.blue, 80), textcolor=color.blue, size=size.tiny)
+if chochUp or chochDown
+    label.new(bar_index, chochUp ? low : high, "CHoCH", style=chochUp ? label.style_label_up : label.style_label_down,
+         color=color.new(color.orange, 80), textcolor=color.orange, size=size.tiny)
+
+// ============================================================================
+// 5. HTF CONFLUENCE (optional) — pull HTF pivot levels for comparison
+// ============================================================================
+[htfPivHi, htfPivLo] = request.security(syminfo.tickerid, htf, [ta.pivothigh(close, pivotLen, pivotLen), ta.pivotlow(close, pivotLen, pivotLen)], lookahead=barmerge.lookahead_off)
+var float lastHtfHi = na
+var float lastHtfLo = na
+if not na(htfPivHi)
+    lastHtfHi := htfPivHi
+if not na(htfPivLo)
+    lastHtfLo := htfPivLo
+
+htfConfluence(float price) =>
+    bool okHi = not na(lastHtfHi) and math.abs(price - lastHtfHi) <= htfTolAtr * atrVal
+    bool okLo = not na(lastHtfLo) and math.abs(price - lastHtfLo) <= htfTolAtr * atrVal
+    okHi or okLo
+
+// ============================================================================
+// 6. PROBABILITY FILTER
+// ============================================================================
+isHighProbability(Level lv) =>
+    bool distOk  = math.abs(close - lv.price) >= minAtrDist * atrVal or true // distance handles at trigger time below
+    bool htfOk   = not useHtf or htfConfluence(lv.price)
+    lv.fresh and not lv.broken and htfOk
+
+// ============================================================================
+// 7. ENTRY / SL / TP LOGIC
+//    Long: price wicks into a fresh, high-probability V-level or bullish Gap
+//          while storyline is bullish (or just gave a bullish CHoCH)
+//    Short: mirror, using A-levels / bearish Gap, storyline bearish
+// ============================================================================
+findNearestOpposing(array<Level> arr, float from, bool wantAbove) =>
+    float best = na
+    for i = 0 to array.size(arr) - 1
+        Level lv = array.get(arr, i)
+        if not lv.broken
+            if wantAbove and lv.price > from
+                if na(best) or lv.price < best
+                    best := lv.price
+            if not wantAbove and lv.price < from
+                if na(best) or lv.price > best
+                    best := lv.price
+    best
+
+longSignal = false
+shortSignal = false
+float entryPrice = na
+float slPrice = na
+float tpPrice = na
+
+if showSignals and trend == "bull"
+    for i = 0 to array.size(vLevels) - 1
+        Level lv = array.get(vLevels, i)
+        if isHighProbability(lv) and low <= lv.price and low >= lv.price - atrVal and close > lv.price
+            longSignal := true
+            entryPrice := close
+            slPrice := lv.price - slBufferAtr * atrVal
+            tpCandidate = findNearestOpposing(aLevels, close, true)
+            tpPrice := na(tpCandidate) ? close + rr * (close - slPrice) : tpCandidate
+
+if showSignals and trend == "bear"
+    for i = 0 to array.size(aLevels) - 1
+        Level lv = array.get(aLevels, i)
+        if isHighProbability(lv) and high >= lv.price and high <= lv.price + atrVal and close < lv.price
+            shortSignal := true
+            entryPrice := close
+            slPrice := lv.price + slBufferAtr * atrVal
+            tpCandidate = findNearestOpposing(vLevels, close, false)
+            tpPrice := na(tpCandidate) ? close - rr * (slPrice - close) : tpCandidate
+
+if longSignal
+    label.new(bar_index, low - atrVal*0.5, "LONG\nEntry: " + str.tostring(entryPrice, "#.####") +
+         "\nSL: " + str.tostring(slPrice, "#.####") + "\nTP: " + str.tostring(tpPrice, "#.####"),
+         style=label.style_label_up, color=color.new(color.green, 20), textcolor=color.white, size=size.small)
+    line.new(bar_index, slPrice, bar_index + 10, slPrice, color=color.red, style=line.style_dotted)
+    line.new(bar_index, tpPrice, bar_index + 10, tpPrice, color=color.green, style=line.style_dotted)
+
+if shortSignal
+    label.new(bar_index, high + atrVal*0.5, "SHORT\nEntry: " + str.tostring(entryPrice, "#.####") +
+         "\nSL: " + str.tostring(slPrice, "#.####") + "\nTP: " + str.tostring(tpPrice, "#.####"),
+         style=label.style_label_down, color=color.new(color.red, 20), textcolor=color.white, size=size.small)
+    line.new(bar_index, slPrice, bar_index + 10, slPrice, color=color.red, style=line.style_dotted)
+    line.new(bar_index, tpPrice, bar_index + 10, tpPrice, color=color.green, style=line.style_dotted)
+
+plotshape(longSignal, title="Long Entry", style=shape.triangleup, location=location.belowbar, color=color.green, size=size.small)
+plotshape(shortSignal, title="Short Entry", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small)
+
+alertcondition(longSignal, "Malaysian SnR Long Signal", "Fresh V-Level reaction in bullish storyline")
+alertcondition(shortSignal, "Malaysian SnR Short Signal", "Fresh A-Level reaction in bearish storyline")
+
+// ============================================================================
+// TREND LABEL (top-right info)
+// ============================================================================
+var label trendLbl = na
+if barstate.islast
+    label.delete(trendLbl)
+    trendLbl := label.new(bar_index + 5, high, "Storyline: " + str.upper(trend),
+         style=label.style_label_left, color=color.new(color.blue, 80), textcolor=color.blue, size=size.normal)
