@@ -48,7 +48,7 @@ atrVal = ta.atr(atrLen)
 // ============================================================================
 drawLevel(Level lv) =>
     color col = lv.broken ? color.gray : (lv.isResistance ? color.red : color.lime)
-    int style = lv.fresh and not lv.broken ? line.style_solid : line.style_dashed
+    string style = lv.fresh and not lv.broken ? line.style_solid : line.style_dashed
     if not na(lv.ln)
         line.set_xy2(lv.ln, bar_index, lv.price)
         line.set_color(lv.ln, col)
@@ -106,18 +106,19 @@ if showGaps and bearGap
 //    - body close through -> broken (flipped)
 // ============================================================================
 updateArray(array<Level> arr) =>
-    for i = 0 to array.size(arr) - 1
-        Level lv = array.get(arr, i)
-        if not lv.broken
-            // wick touch check
-            if high >= lv.price and low <= lv.price
-                lv.fresh := false
-            // body break check
-            bool bodyBroke = lv.isResistance ? close > lv.price and open > lv.price and close[1] <= lv.price
-                                              : close < lv.price and open < lv.price and close[1] >= lv.price
-            if bodyBroke
-                lv.broken := true
-        drawLevel(lv)
+    if array.size(arr) > 0
+        for i = 0 to array.size(arr) - 1
+            Level lv = array.get(arr, i)
+            if not lv.broken
+                // wick touch check
+                if high >= lv.price and low <= lv.price
+                    lv.fresh := false
+                // body break check
+                bool bodyBroke = lv.isResistance ? close > lv.price and open > lv.price and close[1] <= lv.price
+                                                  : close < lv.price and open < lv.price and close[1] >= lv.price
+                if bodyBroke
+                    lv.broken := true
+            drawLevel(lv)
 
 updateArray(aLevels)
 updateArray(vLevels)
@@ -197,15 +198,16 @@ isHighProbability(Level lv) =>
 // ============================================================================
 findNearestOpposing(array<Level> arr, float from, bool wantAbove) =>
     float best = na
-    for i = 0 to array.size(arr) - 1
-        Level lv = array.get(arr, i)
-        if not lv.broken
-            if wantAbove and lv.price > from
-                if na(best) or lv.price < best
-                    best := lv.price
-            if not wantAbove and lv.price < from
-                if na(best) or lv.price > best
-                    best := lv.price
+    if array.size(arr) > 0
+        for i = 0 to array.size(arr) - 1
+            Level lv = array.get(arr, i)
+            if not lv.broken
+                if wantAbove and lv.price > from
+                    if na(best) or lv.price < best
+                        best := lv.price
+                if not wantAbove and lv.price < from
+                    if na(best) or lv.price > best
+                        best := lv.price
     best
 
 longSignal = false
@@ -214,7 +216,7 @@ float entryPrice = na
 float slPrice = na
 float tpPrice = na
 
-if showSignals and trend == "bull"
+if showSignals and trend == "bull" and array.size(vLevels) > 0
     for i = 0 to array.size(vLevels) - 1
         Level lv = array.get(vLevels, i)
         if isHighProbability(lv) and low <= lv.price and low >= lv.price - atrVal and close > lv.price
@@ -224,7 +226,7 @@ if showSignals and trend == "bull"
             tpCandidate = findNearestOpposing(aLevels, close, true)
             tpPrice := na(tpCandidate) ? close + rr * (close - slPrice) : tpCandidate
 
-if showSignals and trend == "bear"
+if showSignals and trend == "bear" and array.size(aLevels) > 0
     for i = 0 to array.size(aLevels) - 1
         Level lv = array.get(aLevels, i)
         if isHighProbability(lv) and high >= lv.price and high <= lv.price + atrVal and close < lv.price
